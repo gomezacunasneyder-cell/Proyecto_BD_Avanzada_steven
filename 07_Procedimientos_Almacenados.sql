@@ -37,7 +37,9 @@ DELIMITER $$
 -- =====================================================================
 -- 1. sp_RealizarNuevaVenta
 -- Procesa una venta completa de forma transaccional: valida stock,
--- inserta el encabezado, inserta el detalle y descuenta el stock.
+-- inserta el encabezado y el detalle de la venta. El descuento real
+-- del stock lo ejecuta el trigger trg_update_stock_after_insert_venta
+-- (bloque 5) al detectar el INSERT en detalle_ventas.
 -- Recibe los productos como dos listas paralelas separadas por comas.
 -- =====================================================================
 CREATE PROCEDURE sp_RealizarNuevaVenta(
@@ -98,10 +100,13 @@ proc_venta: BEGIN
 
         SELECT precio INTO v_precio_actual FROM productos WHERE id_producto = v_id_producto;
 
+        -- El descuento de stock NO se hace aquí: queda a cargo del trigger
+        -- trg_update_stock_after_insert_venta (bloque 5), que se dispara
+        -- automáticamente al insertar en detalle_ventas. Así el stock se
+        -- mantiene consistente sin importar si el INSERT viene de este SP
+        -- o de cualquier otro proceso que inserte directamente en la tabla.
         INSERT INTO detalle_ventas (id_venta, id_producto, cantidad, precio_unitario_congelado)
         VALUES (p_id_venta_generado, v_id_producto, v_cantidad, v_precio_actual);
-
-        UPDATE productos SET stock = stock - v_cantidad WHERE id_producto = v_id_producto;
     END WHILE;
 
     UPDATE ventas
