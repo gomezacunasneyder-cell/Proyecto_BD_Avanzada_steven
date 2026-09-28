@@ -7,7 +7,12 @@ USE ecommerce_db;
 CREATE TABLE categorias (
     id_categoria    INT AUTO_INCREMENT PRIMARY KEY,
     nombre          VARCHAR(100)    NOT NULL UNIQUE,
-    descripcion     TEXT            NULL
+    descripcion     TEXT            NULL,
+    id_categoria_padre INT          NULL,
+
+    CONSTRAINT fk_categoria_padre
+        FOREIGN KEY (id_categoria_padre) REFERENCES categorias(id_categoria)
+        ON UPDATE CASCADE ON DELETE SET NULL
 ) ENGINE = InnoDB;
 
 CREATE TABLE proveedores (
@@ -24,10 +29,11 @@ CREATE TABLE productos (
     precio                  DECIMAL(10,2)   NOT NULL,
     costo                   DECIMAL(10,2)   NOT NULL DEFAULT 0,
     stock                   INT             NOT NULL DEFAULT 0,
+    ubicacion               VARCHAR(100)    NULL,
     umbral_minimo_stock     INT             NOT NULL DEFAULT 5,
     sku                     VARCHAR(50)     NOT NULL UNIQUE,
-    id_categoria            INT             NULL,
-    id_proveedor            INT             NULL,
+    id_categoria            INT             NOT NULL,
+    id_proveedor            INT             NOT NULL,
     fecha_creacion          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     fecha_modificacion      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
                                              ON UPDATE CURRENT_TIMESTAMP,
@@ -43,7 +49,7 @@ CREATE TABLE productos (
 
     CONSTRAINT fk_producto_proveedor
         FOREIGN KEY (id_proveedor) REFERENCES proveedores(id_proveedor)
-        ON UPDATE CASCADE ON DELETE SET NULL
+        ON UPDATE CASCADE ON DELETE RESTRICT
 ) ENGINE = InnoDB;
 
 CREATE INDEX idx_productos_categoria ON productos(id_categoria);
@@ -67,6 +73,7 @@ CREATE TABLE clientes (
 CREATE TABLE ventas (
     id_venta        INT AUTO_INCREMENT PRIMARY KEY,
     id_cliente      INT             NOT NULL,
+    id_sucursal     INT             NOT NULL DEFAULT 1,
     fecha_venta     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     estado          ENUM('Pendiente de Pago','Procesando','Enviado',
                          'Entregado','Cancelado')
@@ -101,6 +108,23 @@ CREATE TABLE detalle_ventas (
 
 CREATE INDEX idx_detalle_venta ON detalle_ventas(id_venta);
 CREATE INDEX idx_detalle_producto ON detalle_ventas(id_producto);
+
+CREATE TABLE vistas_producto (
+    id_vista     BIGINT AUTO_INCREMENT PRIMARY KEY,
+    id_producto  INT NOT NULL,
+    id_cliente   INT NULL,
+    fecha_vista  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_vista_producto
+        FOREIGN KEY (id_producto) REFERENCES productos(id_producto)
+        ON UPDATE CASCADE ON DELETE CASCADE,
+
+    CONSTRAINT fk_vista_cliente
+        FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente)
+        ON UPDATE CASCADE ON DELETE SET NULL
+) ENGINE = InnoDB;
+
+CREATE INDEX idx_vistas_producto_fecha ON vistas_producto(id_producto, fecha_vista);
 
 CREATE TABLE log_cambios_precio (
     id_log          INT AUTO_INCREMENT PRIMARY KEY,
@@ -209,3 +233,20 @@ INSERT INTO detalle_ventas (id_venta, id_producto, cantidad, precio_unitario_con
 (18, 8, 1, 249900),
 (19, 4, 1, 159900),
 (20, 5, 1, 89900);
+
+INSERT INTO vistas_producto (id_producto, id_cliente, fecha_vista) VALUES
+(1, 1, '2026-09-01 08:15:00'),
+(1, 2, '2026-09-02 10:20:00'),
+(1, 3, '2026-09-03 12:30:00'),
+(2, 1, '2026-09-04 09:10:00'),
+(2, 4, '2026-09-05 11:45:00'),
+(3, 2, '2026-09-06 14:00:00'),
+(3, 5, '2026-09-07 16:25:00'),
+(3, 6, '2026-09-08 13:50:00'),
+(4, 3, '2026-09-09 10:05:00'),
+(5, 1, '2026-09-10 15:40:00'),
+(6, 7, '2026-09-11 09:30:00'),
+(8, 8, '2026-09-12 18:10:00'),
+(10, 9, '2026-09-13 12:00:00'),
+(12, 10, '2026-09-14 16:45:00'),
+(14, 2, '2026-09-15 17:15:00');

@@ -15,6 +15,7 @@ SELECT
     SUM(dv.cantidad * dv.precio_unitario_congelado) AS total_ingresos_generados
 FROM detalle_ventas dv
 INNER JOIN productos p ON p.id_producto = dv.id_producto
+INNER JOIN ventas v ON v.id_venta = dv.id_venta AND v.estado <> 'Cancelado'
 GROUP BY p.id_producto, p.nombre
 ORDER BY total_ingresos_generados DESC
 LIMIT 10;
@@ -59,7 +60,7 @@ ORDER BY total_ingresos ASC;
 -- =====================================================================
 SELECT
     c.id_cliente,
-    fn_FormatearNombreCompleto(c.id_cliente) AS nombre_cliente,
+    CONCAT(c.nombre, ' ', c.apellido) AS nombre_cliente,
     COUNT(v.id_venta) AS cantidad_compras_realizadas,
     SUM(v.total) AS valor_vida_cliente_ltv
 FROM clientes c
@@ -110,14 +111,16 @@ ORDER BY anio, trimestre;
 -- =====================================================================
 SELECT
     ROUND(
-        100.0 * SUM(CASE WHEN cantidad_compras > 1 THEN 1 ELSE 0 END) / COUNT(*),
+        100.0 * SUM(CASE WHEN cantidad_compras > 1 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0),
         2
     ) AS porcentaje_clientes_compra_repetida
 FROM (
-    SELECT id_cliente, COUNT(*) AS cantidad_compras
-    FROM ventas
-    WHERE estado <> 'Cancelado'
-    GROUP BY id_cliente
+    SELECT c.id_cliente, COUNT(v.id_venta) AS cantidad_compras
+    FROM clientes c
+    LEFT JOIN ventas v
+        ON v.id_cliente = c.id_cliente
+        AND v.estado <> 'Cancelado'
+    GROUP BY c.id_cliente
 ) AS resumen_compras_por_cliente;
 
 -- =====================================================================
@@ -136,6 +139,7 @@ FROM detalle_ventas dv1
 INNER JOIN detalle_ventas dv2
     ON dv1.id_venta = dv2.id_venta
     AND dv1.id_producto < dv2.id_producto
+INNER JOIN ventas v ON v.id_venta = dv1.id_venta AND v.estado <> 'Cancelado'
 INNER JOIN productos p1 ON p1.id_producto = dv1.id_producto
 INNER JOIN productos p2 ON p2.id_producto = dv2.id_producto
 GROUP BY p1.nombre, p2.nombre
@@ -149,16 +153,26 @@ LIMIT 10;
 -- Lógica: tasa_rotacion = unidades vendidas históricas / stock
 -- promedio actual. NULLIF evita división por cero si el stock es 0.
 -- =====================================================================
+WITH inventario_categoria AS (
+    SELECT id_categoria, AVG(stock) AS stock_promedio_actual
+    FROM productos
+    GROUP BY id_categoria
+), ventas_categoria AS (
+    SELECT p.id_categoria, SUM(dv.cantidad) AS unidades_vendidas
+    FROM productos p
+    INNER JOIN detalle_ventas dv ON dv.id_producto = p.id_producto
+    INNER JOIN ventas v ON v.id_venta = dv.id_venta AND v.estado <> 'Cancelado'
+    GROUP BY p.id_categoria
+)
 SELECT
     cat.id_categoria,
     cat.nombre AS nombre_categoria,
-    COALESCE(SUM(dv.cantidad), 0) AS unidades_vendidas_historicas,
-    ROUND(AVG(p.stock), 2) AS stock_promedio_actual,
-    ROUND(COALESCE(SUM(dv.cantidad), 0) / NULLIF(AVG(p.stock), 0), 2) AS tasa_rotacion_inventario
+    COALESCE(vc.unidades_vendidas, 0) AS unidades_vendidas_historicas,
+    ROUND(COALESCE(ic.stock_promedio_actual, 0), 2) AS stock_promedio_actual,
+    ROUND(COALESCE(vc.unidades_vendidas, 0) / NULLIF(ic.stock_promedio_actual, 0), 2) AS tasa_rotacion_inventario
 FROM categorias cat
-INNER JOIN productos p ON p.id_categoria = cat.id_categoria
-LEFT JOIN detalle_ventas dv ON dv.id_producto = p.id_producto
-GROUP BY cat.id_categoria, cat.nombre
+LEFT JOIN inventario_categoria ic ON ic.id_categoria = cat.id_categoria
+LEFT JOIN ventas_categoria vc ON vc.id_categoria = cat.id_categoria
 ORDER BY tasa_rotacion_inventario DESC;
 
 -- =====================================================================
@@ -191,7 +205,7 @@ ORDER BY unidades_faltantes_para_umbral DESC;
 SELECT
     v.id_venta,
     c.id_cliente,
-    fn_FormatearNombreCompleto(c.id_cliente) AS nombre_cliente,
+    CONCAT(c.nombre, ' ', c.apellido) AS nombre_cliente,
     v.fecha_venta AS fecha_inicio_compra,
     v.total AS monto_en_riesgo,
     TIMESTAMPDIFF(HOUR, v.fecha_venta, NOW()) AS horas_sin_completar_pago
@@ -212,11 +226,12 @@ ORDER BY v.fecha_venta ASC;
 SELECT
     prov.id_proveedor,
     prov.nombre AS nombre_proveedor,
-    COALESCE(SUM(dv.cantidad), 0) AS total_unidades_vendidas,
-    COALESCE(SUM(dv.cantidad * dv.precio_unitario_congelado), 0) AS total_ingresos_generados
+    COALESCE(SUM(CASE WHEN v.id_venta IS NOT NULL THEN dv.cantidad ELSE 0 END), 0) AS total_unidades_vendidas,
+    COALESCE(SUM(CASE WHEN v.id_venta IS NOT NULL THEN dv.cantidad * dv.precio_unitario_congelado ELSE 0 END), 0) AS total_ingresos_generados
 FROM proveedores prov
 LEFT JOIN productos p ON p.id_proveedor = prov.id_proveedor
 LEFT JOIN detalle_ventas dv ON dv.id_producto = p.id_producto
+LEFT JOIN ventas v ON v.id_venta = dv.id_venta AND v.estado <> 'Cancelado'
 GROUP BY prov.id_proveedor, prov.nombre
 ORDER BY total_ingresos_generados DESC;
 
@@ -271,13 +286,24 @@ SELECT
        FROM detalle_ventas dv
        INNER JOIN ventas v ON v.id_venta = dv.id_venta
        WHERE dv.id_producto = lcp.id_producto
-         AND v.fecha_venta BETWEEN DATE_SUB(lcp.fecha_cambio, INTERVAL 7 DAY) AND lcp.fecha_cambio
+                 AND v.estado <> 'Cancelado'
+         AND v.fecha_venta >= DATE_SUB(DATE(lcp.fecha_cambio), INTERVAL 7 DAY)
+         AND v.fecha_venta < DATE(lcp.fecha_cambio)
     ) AS unidades_vendidas_semana_antes,
+        (SELECT COALESCE(SUM(dv.cantidad), 0)
+             FROM detalle_ventas dv
+             INNER JOIN ventas v ON v.id_venta = dv.id_venta
+             WHERE dv.id_producto = lcp.id_producto
+                 AND v.estado <> 'Cancelado'
+                 AND DATE(v.fecha_venta) = DATE(lcp.fecha_cambio)
+        ) AS unidades_vendidas_durante_cambio,
     (SELECT COALESCE(SUM(dv.cantidad), 0)
        FROM detalle_ventas dv
        INNER JOIN ventas v ON v.id_venta = dv.id_venta
        WHERE dv.id_producto = lcp.id_producto
-         AND v.fecha_venta BETWEEN lcp.fecha_cambio AND DATE_ADD(lcp.fecha_cambio, INTERVAL 7 DAY)
+                 AND v.estado <> 'Cancelado'
+         AND v.fecha_venta > DATE(lcp.fecha_cambio)
+         AND v.fecha_venta < DATE_ADD(DATE(lcp.fecha_cambio), INTERVAL 8 DAY)
     ) AS unidades_vendidas_semana_despues
 FROM log_cambios_precio lcp
 INNER JOIN productos p ON p.id_producto = lcp.id_producto
@@ -362,23 +388,29 @@ ORDER BY promedio_dias_entre_compras ASC;
 -- 18. PRODUCTOS MÁS VISTOS VS. COMPRADOS
 -- Pregunta de negocio: ¿qué productos generan más interés (vistas) en
 -- comparación con lo que realmente se compra?
--- NOTA METODOLÓGICA: el esquema no incluye una tabla de tracking de
--- visualizaciones de producto (no está contemplada en la sección de
--- entidades del enunciado). Para implementar esta consulta con datos
--- reales se necesitaría una tabla adicional, por ejemplo:
---   vistas_producto(id_vista, id_producto, id_cliente, fecha_vista)
--- Como alternativa dentro del alcance actual, se muestra el ranking
--- de productos más COMPRADOS, que puede servir de base de comparación
--- una vez se agregue el tracking de vistas.
+-- Las visualizaciones se registran en vistas_producto; las compras
+-- excluyen ventas canceladas y se agregan por separado para evitar
+-- que el cruce de vistas con detalles multiplique los conteos.
 -- =====================================================================
+WITH vistas_por_producto AS (
+    SELECT id_producto, COUNT(*) AS total_vistas
+    FROM vistas_producto
+    GROUP BY id_producto
+), compras_por_producto AS (
+    SELECT dv.id_producto, SUM(dv.cantidad) AS total_unidades_compradas
+    FROM detalle_ventas dv
+    INNER JOIN ventas v ON v.id_venta = dv.id_venta AND v.estado <> 'Cancelado'
+    GROUP BY dv.id_producto
+)
 SELECT
     p.id_producto,
     p.nombre AS nombre_producto,
-    COALESCE(SUM(dv.cantidad), 0) AS total_unidades_compradas
+    COALESCE(vp.total_vistas, 0) AS total_vistas,
+    COALESCE(cp.total_unidades_compradas, 0) AS total_unidades_compradas
 FROM productos p
-LEFT JOIN detalle_ventas dv ON dv.id_producto = p.id_producto
-GROUP BY p.id_producto, p.nombre
-ORDER BY total_unidades_compradas DESC;
+LEFT JOIN vistas_por_producto vp ON vp.id_producto = p.id_producto
+LEFT JOIN compras_por_producto cp ON cp.id_producto = p.id_producto
+ORDER BY total_vistas DESC, total_unidades_compradas DESC;
 
 -- =====================================================================
 -- 19. SEGMENTACIÓN DE CLIENTES (RFM)
@@ -392,7 +424,7 @@ ORDER BY total_unidades_compradas DESC;
 WITH rfm_base AS (
     SELECT
         c.id_cliente,
-        fn_FormatearNombreCompleto(c.id_cliente) AS nombre_cliente,
+        CONCAT(c.nombre, ' ', c.apellido) AS nombre_cliente,
         DATEDIFF(NOW(), MAX(v.fecha_venta)) AS dias_desde_ultima_compra,
         COUNT(v.id_venta) AS cantidad_compras,
         SUM(v.total) AS monto_total_gastado

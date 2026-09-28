@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS alertas_stock (
     fecha_alerta    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE = InnoDB;
 
+GRANT SELECT ON ecommerce_db.alertas_stock TO 'Analista_Datos';
+
 CREATE TABLE IF NOT EXISTS ventas_archivadas (
     id_venta_original  INT NOT NULL,
     id_cliente         INT NOT NULL,
@@ -40,8 +42,8 @@ CREATE TABLE IF NOT EXISTS ventas_archivadas (
 -- Tabla que simula el catálogo de permisos asignados (MySQL no permite
 -- crear triggers directamente sobre sentencias GRANT/REVOKE, que son
 -- DCL). Para cumplir el requisito de auditar cambios de permisos, los
--- cambios se registran en esta tabla intermedia y el trigger reacciona
--- sobre ella.
+-- cambios deben registrarse explícitamente por la aplicación o por un
+-- procedimiento de administración; GRANT/REVOKE no disparan este trigger.
 CREATE TABLE IF NOT EXISTS permisos_usuarios (
     id_permiso      INT AUTO_INCREMENT PRIMARY KEY,
     usuario         VARCHAR(100) NOT NULL,
@@ -58,7 +60,7 @@ CREATE TABLE IF NOT EXISTS auditoria_permisos (
 ) ENGINE = InnoDB;
 
 ALTER TABLE clientes
-    ADD COLUMN id_referido INT NULL AFTER credito_disponible;
+    ADD COLUMN id_referido INT NULL AFTER total_gastado;
 
 ALTER TABLE categorias
     ADD COLUMN contador_productos INT NOT NULL DEFAULT 0;
@@ -74,6 +76,20 @@ SET contador_productos = (
 INSERT INTO categorias (nombre, descripcion)
 SELECT 'General', 'Categoría por defecto para productos sin clasificar'
 WHERE NOT EXISTS (SELECT 1 FROM categorias WHERE nombre = 'General');
+
+UPDATE clientes c
+SET total_gastado = (
+                SELECT COALESCE(SUM(v.total), 0)
+                FROM ventas v
+                WHERE v.id_cliente = c.id_cliente
+                    AND v.estado <> 'Cancelado'
+        ),
+        fecha_ultima_compra = (
+                SELECT MAX(v.fecha_venta)
+                FROM ventas v
+                WHERE v.id_cliente = c.id_cliente
+                    AND v.estado <> 'Cancelado'
+        );
 
 DELIMITER $$
 
@@ -169,9 +185,24 @@ CREATE TRIGGER trg_update_total_gastado_cliente
 AFTER UPDATE ON ventas
 FOR EACH ROW
 BEGIN
-    IF NEW.total <> OLD.total AND NEW.estado <> 'Cancelado' THEN
+    IF NEW.total <> OLD.total OR NEW.estado <> OLD.estado OR NEW.id_cliente <> OLD.id_cliente THEN
         UPDATE clientes
-            SET total_gastado = total_gastado + (NEW.total - OLD.total)
+            SET total_gastado = total_gastado
+                - CASE WHEN OLD.estado <> 'Cancelado' THEN OLD.total ELSE 0 END,
+                fecha_ultima_compra = CASE
+                    WHEN fecha_ultima_compra = OLD.fecha_venta THEN NULL
+                    ELSE fecha_ultima_compra
+                END
+            WHERE id_cliente = OLD.id_cliente;
+
+        UPDATE clientes
+            SET total_gastado = total_gastado
+                + CASE WHEN NEW.estado <> 'Cancelado' THEN NEW.total ELSE 0 END,
+                fecha_ultima_compra = CASE
+                    WHEN NEW.estado <> 'Cancelado'
+                        THEN GREATEST(COALESCE(fecha_ultima_compra, NEW.fecha_venta), NEW.fecha_venta)
+                    ELSE fecha_ultima_compra
+                END
             WHERE id_cliente = NEW.id_cliente;
     END IF;
 END$$
@@ -231,7 +262,7 @@ AFTER INSERT ON detalle_ventas
 FOR EACH ROW
 BEGIN
     UPDATE ventas
-        SET total = fn_CalcularTotalVenta(NEW.id_venta)
+    SET total = total + (NEW.cantidad * NEW.precio_unitario_congelado)
         WHERE id_venta = NEW.id_venta;
 END$$
 
@@ -294,6 +325,21 @@ FOR EACH ROW
 BEGIN
     INSERT INTO ventas_archivadas (id_venta_original, id_cliente, fecha_venta, estado, total)
     VALUES (OLD.id_venta, OLD.id_cliente, OLD.fecha_venta, OLD.estado, OLD.total);
+
+    IF OLD.estado <> 'Cancelado' THEN
+        UPDATE productos p
+        INNER JOIN (
+            SELECT id_producto, SUM(cantidad) AS cantidad_devuelta
+            FROM detalle_ventas
+            WHERE id_venta = OLD.id_venta
+            GROUP BY id_producto
+        ) dv ON dv.id_producto = p.id_producto
+        SET p.stock = p.stock + dv.cantidad_devuelta;
+
+        UPDATE clientes
+            SET total_gastado = total_gastado - OLD.total
+            WHERE id_cliente = OLD.id_cliente;
+    END IF;
 END$$
 
 -- =====================================================================
@@ -322,7 +368,10 @@ AFTER INSERT ON ventas
 FOR EACH ROW
 BEGIN
     UPDATE clientes
-        SET fecha_ultima_compra = NEW.fecha_venta
+        SET fecha_ultima_compra = GREATEST(
+            COALESCE(fecha_ultima_compra, NEW.fecha_venta),
+            NEW.fecha_venta
+        )
         WHERE id_cliente = NEW.id_cliente;
 END$$
 
@@ -392,6 +441,121 @@ BEGIN
     UPDATE categorias
         SET contador_productos = contador_productos + 1
         WHERE id_categoria = NEW.id_categoria;
+END$$
+
+CREATE TRIGGER trg_check_stock_before_update_detalle
+BEFORE UPDATE ON detalle_ventas
+FOR EACH ROW
+BEGIN
+    DECLARE v_stock_disponible INT;
+
+    IF NEW.cantidad <= 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'La cantidad debe ser mayor que cero.';
+    END IF;
+
+    SELECT stock INTO v_stock_disponible
+        FROM productos WHERE id_producto = NEW.id_producto;
+
+    IF NEW.id_producto = OLD.id_producto THEN
+        IF v_stock_disponible + OLD.cantidad < NEW.cantidad THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'Stock insuficiente para actualizar esta línea.';
+        END IF;
+    ELSEIF v_stock_disponible < NEW.cantidad THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Stock insuficiente para el nuevo producto.';
+    END IF;
+END$$
+
+CREATE TRIGGER trg_update_stock_and_total_after_detail_update
+AFTER UPDATE ON detalle_ventas
+FOR EACH ROW
+BEGIN
+    UPDATE productos SET stock = stock + OLD.cantidad
+        WHERE id_producto = OLD.id_producto;
+    UPDATE productos SET stock = stock - NEW.cantidad
+        WHERE id_producto = NEW.id_producto;
+
+    IF NEW.id_venta = OLD.id_venta THEN
+        UPDATE ventas
+            SET total = total - (OLD.cantidad * OLD.precio_unitario_congelado)
+                       + (NEW.cantidad * NEW.precio_unitario_congelado)
+            WHERE id_venta = OLD.id_venta;
+    ELSE
+        UPDATE ventas
+            SET total = total - (OLD.cantidad * OLD.precio_unitario_congelado)
+            WHERE id_venta = OLD.id_venta;
+        UPDATE ventas
+            SET total = total + (NEW.cantidad * NEW.precio_unitario_congelado)
+            WHERE id_venta = NEW.id_venta;
+    END IF;
+END$$
+
+CREATE TRIGGER trg_restock_and_recalculate_after_detail_delete
+AFTER DELETE ON detalle_ventas
+FOR EACH ROW
+BEGIN
+    UPDATE productos SET stock = stock + OLD.cantidad
+        WHERE id_producto = OLD.id_producto;
+    UPDATE ventas
+        SET total = total - (OLD.cantidad * OLD.precio_unitario_congelado)
+        WHERE id_venta = OLD.id_venta;
+END$$
+
+CREATE TRIGGER trg_validate_email_before_customer_update
+BEFORE UPDATE ON clientes
+FOR EACH ROW
+BEGIN
+    IF NOT fn_ValidarFormatoEmail(NEW.email) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'El formato del email del cliente no es válido.';
+    END IF;
+END$$
+
+CREATE TRIGGER trg_update_category_count_after_product_update
+AFTER UPDATE ON productos
+FOR EACH ROW
+BEGIN
+    IF NOT (NEW.id_categoria <=> OLD.id_categoria) THEN
+        IF OLD.id_categoria IS NOT NULL THEN
+            UPDATE categorias
+                SET contador_productos = contador_productos - 1
+                WHERE id_categoria = OLD.id_categoria;
+        END IF;
+        IF NEW.id_categoria IS NOT NULL THEN
+            UPDATE categorias
+                SET contador_productos = contador_productos + 1
+                WHERE id_categoria = NEW.id_categoria;
+        END IF;
+    END IF;
+END$$
+
+CREATE TRIGGER trg_update_category_count_after_product_delete
+AFTER DELETE ON productos
+FOR EACH ROW
+BEGIN
+    IF OLD.id_categoria IS NOT NULL THEN
+        UPDATE categorias
+            SET contador_productos = contador_productos - 1
+            WHERE id_categoria = OLD.id_categoria;
+    END IF;
+END$$
+
+CREATE TRIGGER trg_restore_stock_after_sale_cancel
+AFTER UPDATE ON ventas
+FOR EACH ROW
+BEGIN
+    IF NEW.estado = 'Cancelado' AND OLD.estado <> 'Cancelado' THEN
+        UPDATE productos p
+        INNER JOIN (
+            SELECT id_producto, SUM(cantidad) AS cantidad_devuelta
+            FROM detalle_ventas
+            WHERE id_venta = NEW.id_venta
+            GROUP BY id_producto
+        ) dv ON dv.id_producto = p.id_producto
+        SET p.stock = p.stock + dv.cantidad_devuelta;
+    END IF;
 END$$
 
 DELIMITER ;

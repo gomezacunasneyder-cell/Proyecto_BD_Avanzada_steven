@@ -13,6 +13,55 @@ ALTER TABLE clientes
     ADD COLUMN credito_disponible DECIMAL(12,2) NOT NULL DEFAULT 0
     AFTER total_gastado;
 
+ALTER TABLE clientes_backup
+    ADD COLUMN credito_disponible DECIMAL(12,2) NOT NULL DEFAULT 0
+    AFTER total_gastado;
+
+CREATE TABLE IF NOT EXISTS auditoria_ajustes_stock (
+    id_ajuste       INT AUTO_INCREMENT PRIMARY KEY,
+    id_producto     INT NOT NULL,
+    ajuste          INT NOT NULL,
+    stock_anterior  INT NOT NULL,
+    stock_nuevo     INT NOT NULL,
+    motivo          VARCHAR(255) NOT NULL,
+    fecha_ajuste    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_ajuste_producto
+        FOREIGN KEY (id_producto) REFERENCES productos(id_producto)
+        ON UPDATE CASCADE ON DELETE RESTRICT
+) ENGINE = InnoDB;
+
+CREATE TABLE IF NOT EXISTS devoluciones_producto (
+    id_devolucion  INT AUTO_INCREMENT PRIMARY KEY,
+    id_detalle     INT NOT NULL UNIQUE,
+    id_producto    INT NOT NULL,
+    id_cliente     INT NOT NULL,
+    cantidad       INT NOT NULL,
+    monto_credito  DECIMAL(12,2) NOT NULL,
+    motivo         VARCHAR(255) NOT NULL,
+    fecha_devolucion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_devolucion_cantidad CHECK (cantidad > 0),
+    CONSTRAINT fk_devolucion_detalle
+        FOREIGN KEY (id_detalle) REFERENCES detalle_ventas(id_detalle)
+        ON UPDATE CASCADE ON DELETE RESTRICT,
+    CONSTRAINT fk_devolucion_producto
+        FOREIGN KEY (id_producto) REFERENCES productos(id_producto)
+        ON UPDATE CASCADE ON DELETE RESTRICT,
+    CONSTRAINT fk_devolucion_cliente
+        FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente)
+        ON UPDATE CASCADE ON DELETE RESTRICT
+) ENGINE = InnoDB;
+
+CREATE TABLE IF NOT EXISTS notificaciones_pedido (
+    id_notificacion INT AUTO_INCREMENT PRIMARY KEY,
+    id_venta        INT NOT NULL,
+    estado_nuevo    VARCHAR(30) NOT NULL,
+    fecha_creacion  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    procesada       BOOLEAN NOT NULL DEFAULT FALSE,
+    CONSTRAINT fk_notificacion_venta
+        FOREIGN KEY (id_venta) REFERENCES ventas(id_venta)
+        ON UPDATE CASCADE ON DELETE CASCADE
+) ENGINE = InnoDB;
+
 CREATE TABLE IF NOT EXISTS resenas_producto (
     id_resena       INT AUTO_INCREMENT PRIMARY KEY,
     id_producto     INT             NOT NULL,
@@ -31,6 +80,8 @@ CREATE TABLE IF NOT EXISTS resenas_producto (
         FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente)
         ON UPDATE CASCADE ON DELETE CASCADE
 ) ENGINE = InnoDB;
+
+GRANT SELECT ON ecommerce_db.resenas_producto TO 'Analista_Datos';
 
 DELIMITER $$
 
@@ -173,6 +224,7 @@ proc_devolucion: BEGIN
     DECLARE v_cantidad INT;
     DECLARE v_precio_unitario DECIMAL(10,2);
     DECLARE v_id_cliente INT;
+    DECLARE v_estado_venta VARCHAR(30);
     DECLARE v_monto_credito DECIMAL(12,2);
 
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
@@ -183,27 +235,51 @@ proc_devolucion: BEGIN
 
     START TRANSACTION;
 
-    SELECT id_venta, id_producto, cantidad, precio_unitario_congelado
-        INTO v_id_venta, v_id_producto, v_cantidad, v_precio_unitario
-        FROM detalle_ventas WHERE id_detalle = p_id_detalle;
+    SELECT dv.id_venta, dv.id_producto, dv.cantidad,
+           dv.precio_unitario_congelado, v.id_cliente, v.estado
+        INTO v_id_venta, v_id_producto, v_cantidad, v_precio_unitario,
+             v_id_cliente, v_estado_venta
+        FROM detalle_ventas dv
+        INNER JOIN ventas v ON v.id_venta = dv.id_venta
+        WHERE dv.id_detalle = p_id_detalle
+        FOR UPDATE;
 
     IF v_id_venta IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'El detalle de venta indicado no existe.';
     END IF;
 
-    SELECT id_cliente INTO v_id_cliente FROM ventas WHERE id_venta = v_id_venta;
+    IF v_estado_venta = 'Cancelado' THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'No se puede devolver un detalle de una venta cancelada.';
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM devoluciones_producto WHERE id_detalle = p_id_detalle) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Este detalle ya fue devuelto.';
+    END IF;
+
+    IF p_motivo IS NULL OR TRIM(p_motivo) = '' THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Debe indicar el motivo de la devolución.';
+    END IF;
+
     SET v_monto_credito = v_cantidad * v_precio_unitario;
 
-    UPDATE productos SET stock = stock + v_cantidad WHERE id_producto = v_id_producto;
+    INSERT INTO devoluciones_producto
+        (id_detalle, id_producto, id_cliente, cantidad, monto_credito, motivo)
+    VALUES
+        (p_id_detalle, v_id_producto, v_id_cliente, v_cantidad, v_monto_credito, p_motivo);
+
+    UPDATE productos
+        SET stock = stock + v_cantidad
+        WHERE id_producto = v_id_producto;
 
     UPDATE clientes
         SET credito_disponible = credito_disponible + v_monto_credito
         WHERE id_cliente = v_id_cliente;
 
-    DELETE FROM detalle_ventas WHERE id_detalle = p_id_detalle;
-
     UPDATE ventas
-        SET total = fn_CalcularTotalVenta(v_id_venta)
+        SET total = GREATEST(total - v_monto_credito, 0)
         WHERE id_venta = v_id_venta;
 
     COMMIT;
@@ -246,9 +322,25 @@ CREATE PROCEDURE sp_AjustarNivelStock(
 BEGIN
     DECLARE v_stock_actual INT;
 
-    SELECT stock INTO v_stock_actual FROM productos WHERE id_producto = p_id_producto;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
 
-    IF (v_stock_actual + p_cantidad_ajuste) < 0 THEN
+    START TRANSACTION;
+
+    SELECT stock INTO v_stock_actual
+        FROM productos
+        WHERE id_producto = p_id_producto
+        FOR UPDATE;
+
+    IF v_stock_actual IS NULL THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'El producto indicado no existe.';
+    END IF;
+
+    IF p_cantidad_ajuste IS NULL OR (v_stock_actual + p_cantidad_ajuste) < 0 THEN
         SIGNAL SQLSTATE '45000'
             SET MESSAGE_TEXT = 'El ajuste dejaría el stock en un valor negativo.';
     END IF;
@@ -256,6 +348,14 @@ BEGIN
     UPDATE productos
         SET stock = stock + p_cantidad_ajuste
         WHERE id_producto = p_id_producto;
+
+    INSERT INTO auditoria_ajustes_stock
+        (id_producto, ajuste, stock_anterior, stock_nuevo, motivo)
+    VALUES
+        (p_id_producto, p_cantidad_ajuste, v_stock_actual,
+         v_stock_actual + p_cantidad_ajuste, p_motivo);
+
+    COMMIT;
 
     SELECT CONCAT('Ajuste aplicado. Motivo: ', p_motivo) AS resultado;
 END$$
@@ -323,12 +423,39 @@ CREATE PROCEDURE sp_CambiarEstadoPedido(
     IN p_id_venta INT,
     IN p_nuevo_estado VARCHAR(30)
 )
-BEGIN
-    IF p_nuevo_estado NOT IN ('Pendiente de Pago','Pagado','Procesando','Enviado','Entregado','Cancelado') THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Estado de pedido no válido.';
+proc_cambiar_estado: BEGIN
+    DECLARE v_estado_actual VARCHAR(30);
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+
+    SELECT estado INTO v_estado_actual
+        FROM ventas
+        WHERE id_venta = p_id_venta
+        FOR UPDATE;
+
+    IF v_estado_actual IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'La venta indicada no existe.';
+    END IF;
+
+    IF NOT (
+        (v_estado_actual = 'Pendiente de Pago' AND p_nuevo_estado IN ('Pagado', 'Cancelado')) OR
+        (v_estado_actual = 'Pagado' AND p_nuevo_estado IN ('Procesando', 'Cancelado')) OR
+        (v_estado_actual = 'Procesando' AND p_nuevo_estado IN ('Enviado', 'Cancelado')) OR
+        (v_estado_actual = 'Enviado' AND p_nuevo_estado = 'Entregado')
+    ) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Transición de estado no permitida.';
     END IF;
 
     UPDATE ventas SET estado = p_nuevo_estado WHERE id_venta = p_id_venta;
+    INSERT INTO notificaciones_pedido (id_venta, estado_nuevo)
+    VALUES (p_id_venta, p_nuevo_estado);
+
+    COMMIT;
 END$$
 
 -- =====================================================================
@@ -341,6 +468,7 @@ CREATE PROCEDURE sp_RegistrarNuevoCliente(
     IN p_nombre VARCHAR(100),
     IN p_apellido VARCHAR(100),
     IN p_email VARCHAR(150),
+    IN p_contrasena VARCHAR(255),
     IN p_contrasena_hash VARCHAR(255),
     IN p_direccion_envio VARCHAR(255),
     IN p_ciudad VARCHAR(100)
@@ -352,6 +480,14 @@ BEGIN
 
     IF NOT fn_ValidarFormatoEmail(p_email) THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'El formato del email no es válido.';
+    END IF;
+
+    IF NOT fn_ValidarComplejidadContrasena(p_contrasena) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'La contraseña no cumple la complejidad mínima requerida.';
+    END IF;
+
+    IF p_contrasena_hash IS NULL OR TRIM(p_contrasena_hash) = '' THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Debe proporcionar el hash generado por la aplicación.';
     END IF;
 
     INSERT INTO clientes (nombre, apellido, email, contrasena_hash, direccion_envio, ciudad)
@@ -386,6 +522,8 @@ CREATE PROCEDURE sp_FusionarCuentasCliente(
     IN p_id_cliente_duplicado INT
 )
 proc_fusion: BEGIN
+    DECLARE v_credito_duplicado DECIMAL(12,2);
+
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         ROLLBACK;
@@ -398,15 +536,27 @@ proc_fusion: BEGIN
 
     START TRANSACTION;
 
+    IF NOT EXISTS (SELECT 1 FROM clientes WHERE id_cliente = p_id_cliente_principal)
+       OR NOT EXISTS (SELECT 1 FROM clientes WHERE id_cliente = p_id_cliente_duplicado) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Ambas cuentas deben existir para poder fusionarlas.';
+    END IF;
+
+    SELECT credito_disponible INTO v_credito_duplicado
+        FROM clientes
+        WHERE id_cliente = p_id_cliente_duplicado
+        FOR UPDATE;
+
     UPDATE ventas
         SET id_cliente = p_id_cliente_principal
         WHERE id_cliente = p_id_cliente_duplicado;
 
     UPDATE clientes
-        SET total_gastado = total_gastado + (
-            SELECT COALESCE(SUM(total), 0) FROM ventas WHERE id_cliente = p_id_cliente_principal
-        )
+        SET credito_disponible = credito_disponible + v_credito_duplicado
         WHERE id_cliente = p_id_cliente_principal;
+
+    UPDATE clientes
+        SET credito_disponible = 0
+        WHERE id_cliente = p_id_cliente_duplicado;
 
     CALL sp_EliminarClienteDeFormaSegura(p_id_cliente_duplicado);
 
@@ -575,3 +725,5 @@ proc_mover: BEGIN
 END$$
 
 DELIMITER ;
+
+GRANT EXECUTE ON PROCEDURE ecommerce_db.sp_GenerarReporteMensualVentas TO 'Gerente_Marketing';

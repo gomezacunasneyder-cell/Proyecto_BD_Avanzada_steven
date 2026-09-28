@@ -45,6 +45,9 @@ DETERMINISTIC
 READS SQL DATA
 BEGIN
     DECLARE v_stock INT;
+    IF p_cantidad IS NULL OR p_cantidad <= 0 THEN
+        RETURN FALSE;
+    END IF;
     SELECT stock INTO v_stock FROM productos WHERE id_producto = p_id_producto;
     IF v_stock IS NULL THEN
         RETURN FALSE;
@@ -64,7 +67,7 @@ END$$
 
 CREATE FUNCTION fn_CalcularEdadCliente(p_id_cliente INT)
 RETURNS INT
-DETERMINISTIC
+NOT DETERMINISTIC
 READS SQL DATA
 BEGIN
     DECLARE v_fecha_nac DATE;
@@ -94,12 +97,12 @@ END$$
 
 CREATE FUNCTION fn_EsClienteNuevo(p_id_cliente INT)
 RETURNS BOOLEAN
-DETERMINISTIC
+NOT DETERMINISTIC
 READS SQL DATA
 BEGIN
     DECLARE v_primera_compra DATETIME;
     SELECT MIN(fecha_venta) INTO v_primera_compra
-        FROM ventas WHERE id_cliente = p_id_cliente;
+        FROM ventas WHERE id_cliente = p_id_cliente AND estado <> 'Cancelado';
     IF v_primera_compra IS NULL THEN
         RETURN FALSE;
     END IF;
@@ -145,7 +148,7 @@ READS SQL DATA
 BEGIN
     DECLARE v_ultima DATETIME;
     SELECT MAX(fecha_venta) INTO v_ultima
-        FROM ventas WHERE id_cliente = p_id_cliente;
+        FROM ventas WHERE id_cliente = p_id_cliente AND estado <> 'Cancelado';
     RETURN v_ultima;
 END$$
 
@@ -180,18 +183,18 @@ READS SQL DATA
 BEGIN
     DECLARE v_total INT;
     SELECT COUNT(*) INTO v_total
-        FROM ventas WHERE id_cliente = p_id_cliente;
+        FROM ventas WHERE id_cliente = p_id_cliente AND estado <> 'Cancelado';
     RETURN v_total;
 END$$
 
 CREATE FUNCTION fn_CalcularDiasDesdeUltimaCompra(p_id_cliente INT)
 RETURNS INT
-DETERMINISTIC
+NOT DETERMINISTIC
 READS SQL DATA
 BEGIN
     DECLARE v_ultima DATETIME;
     SELECT MAX(fecha_venta) INTO v_ultima
-        FROM ventas WHERE id_cliente = p_id_cliente;
+        FROM ventas WHERE id_cliente = p_id_cliente AND estado <> 'Cancelado';
     IF v_ultima IS NULL THEN
         RETURN NULL;
     END IF;
@@ -220,12 +223,14 @@ END$$
 
 CREATE FUNCTION fn_GenerarSKU(p_nombre_producto VARCHAR(150), p_id_categoria INT)
 RETURNS VARCHAR(50)
-DETERMINISTIC
+NOT DETERMINISTIC
 READS SQL DATA
 BEGIN
     DECLARE v_prefijo_categoria VARCHAR(10);
     DECLARE v_prefijo_nombre VARCHAR(10);
-    DECLARE v_sufijo VARCHAR(6);
+    DECLARE v_sufijo VARCHAR(9);
+    DECLARE v_sku VARCHAR(50);
+    DECLARE v_sku_existente INT DEFAULT 1;
 
     SELECT UPPER(LEFT(REPLACE(nombre, ' ', ''), 4)) INTO v_prefijo_categoria
         FROM categorias WHERE id_categoria = p_id_categoria;
@@ -234,10 +239,17 @@ BEGIN
         SET v_prefijo_categoria = 'GEN';
     END IF;
 
-    SET v_prefijo_nombre = UPPER(LEFT(REPLACE(p_nombre_producto, ' ', ''), 4));
-    SET v_sufijo = LPAD(FLOOR(RAND() * 999999), 6, '0');
+    SET v_prefijo_nombre = UPPER(LEFT(REPLACE(COALESCE(p_nombre_producto, 'GEN'), ' ', ''), 4));
 
-    RETURN CONCAT('SKU-', v_prefijo_categoria, '-', v_prefijo_nombre, '-', v_sufijo);
+    WHILE v_sku_existente > 0 DO
+        SET v_sufijo = LPAD(FLOOR(RAND() * 1000000000), 9, '0');
+        SET v_sku = CONCAT('SKU-', v_prefijo_categoria, '-', v_prefijo_nombre, '-', v_sufijo);
+        SELECT COUNT(*) INTO v_sku_existente
+            FROM productos
+            WHERE sku = v_sku;
+    END WHILE;
+
+    RETURN v_sku;
 END$$
 
 CREATE FUNCTION fn_CalcularIVA(p_monto DECIMAL(12,2))
@@ -266,7 +278,7 @@ END$$
 
 CREATE FUNCTION fn_EstimarFechaEntrega(p_id_cliente INT)
 RETURNS DATE
-DETERMINISTIC
+NOT DETERMINISTIC
 READS SQL DATA
 BEGIN
     DECLARE v_ciudad VARCHAR(100);
@@ -301,7 +313,7 @@ RETURNS BOOLEAN
 DETERMINISTIC
 NO SQL
 BEGIN
-    IF p_contrasena IS NULL OR LENGTH(p_contrasena) < 8 THEN
+    IF p_contrasena IS NULL OR LENGTH(p_contrasena) < 12 THEN
         RETURN FALSE;
     END IF;
     IF p_contrasena NOT REGEXP '[A-Z]' THEN

@@ -16,8 +16,16 @@ CREATE TABLE IF NOT EXISTS reporte_ventas_semanales (
     semana_fin          DATE NOT NULL,
     cantidad_ventas     INT NOT NULL,
     monto_total_vendido DECIMAL(14,2) NOT NULL,
-    fecha_generacion    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    fecha_generacion    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_reporte_semana (semana_inicio)
 ) ENGINE = InnoDB;
+
+CREATE TABLE IF NOT EXISTS log_cambios_precio_archivo LIKE log_cambios_precio;
+
+ALTER TABLE log_cambios_precio_archivo
+    ADD COLUMN fecha_archivado DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP;
+
+GRANT SELECT ON ecommerce_db.log_cambios_precio_archivo TO 'Auditor_Financiero';
 
 -- ---------------------------------------------------------------------
 -- Tablas auxiliares adicionales requeridas por otros eventos de este
@@ -61,7 +69,9 @@ CREATE TABLE IF NOT EXISTS inconsistencias_detectadas (
 CREATE TABLE IF NOT EXISTS cupones_cumpleanos (
     id_cupon         INT AUTO_INCREMENT PRIMARY KEY,
     id_cliente       INT NOT NULL,
-    fecha_generacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    anio_cupon       YEAR NOT NULL,
+    fecha_generacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_cupon_cliente_anio (id_cliente, anio_cupon)
 ) ENGINE = InnoDB;
 
 CREATE TABLE IF NOT EXISTS ranking_productos (
@@ -90,7 +100,8 @@ CREATE TABLE IF NOT EXISTS reporte_proveedores_mensual (
     mes                INT NOT NULL,
     unidades_vendidas  INT NOT NULL,
     ingresos_generados DECIMAL(14,2) NOT NULL,
-    fecha_generacion   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    fecha_generacion   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_reporte_proveedor_mes (id_proveedor, anio, mes)
 ) ENGINE = InnoDB;
 
 CREATE TABLE IF NOT EXISTS tamano_bd_historico (
@@ -106,7 +117,8 @@ CREATE TABLE IF NOT EXISTS kpis_mensuales (
     total_ventas        INT NOT NULL,
     monto_total_vendido DECIMAL(14,2) NOT NULL,
     clientes_nuevos     INT NOT NULL,
-    fecha_generacion    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    fecha_generacion    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_kpi_mes (anio, mes)
 ) ENGINE = InnoDB;
 
 -- MySQL no soporta vistas materializadas de forma nativa. Como
@@ -120,6 +132,20 @@ CREATE TABLE IF NOT EXISTS mv_resumen_categorias (
     fecha_actualizacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
                          ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE = InnoDB;
+
+GRANT SELECT ON ecommerce_db.reporte_ventas_semanales TO 'Analista_Datos';
+GRANT SELECT ON ecommerce_db.promociones TO 'Analista_Datos';
+GRANT SELECT ON ecommerce_db.lista_reabastecimiento TO 'Analista_Datos';
+GRANT SELECT ON ecommerce_db.resumen_ventas_diarias TO 'Analista_Datos';
+GRANT SELECT ON ecommerce_db.cupones_cumpleanos TO 'Analista_Datos';
+GRANT SELECT ON ecommerce_db.ranking_productos TO 'Analista_Datos';
+GRANT SELECT ON ecommerce_db.productos_backup TO 'Analista_Datos';
+GRANT SELECT ON ecommerce_db.ventas_backup TO 'Analista_Datos';
+GRANT SELECT ON ecommerce_db.clientes_backup TO 'Analista_Datos';
+GRANT SELECT ON ecommerce_db.reporte_proveedores_mensual TO 'Analista_Datos';
+GRANT SELECT ON ecommerce_db.tamano_bd_historico TO 'Analista_Datos';
+GRANT SELECT ON ecommerce_db.kpis_mensuales TO 'Analista_Datos';
+GRANT SELECT ON ecommerce_db.mv_resumen_categorias TO 'Analista_Datos';
 
 DELIMITER $$
 
@@ -139,7 +165,11 @@ BEGIN
         COALESCE(SUM(total), 0)
     FROM ventas
     WHERE fecha_venta >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
-      AND estado <> 'Cancelado';
+            AND estado <> 'Cancelado'
+        ON DUPLICATE KEY UPDATE
+                semana_fin = VALUES(semana_fin),
+                cantidad_ventas = VALUES(cantidad_ventas),
+                monto_total_vendido = VALUES(monto_total_vendido);
 END$$
 
 -- =====================================================================
@@ -156,14 +186,22 @@ DO
 
 -- =====================================================================
 -- 3. evt_archive_old_logs_monthly
--- Cada mes, archiva (aquí: elimina) registros de log_cambios_precio de
--- más de 6 meses, ya que su información relevante ya fue auditada.
+-- Cada mes, mueve a histórico registros de log_cambios_precio de más
+-- de 6 meses antes de eliminarlos de la tabla operativa.
 -- =====================================================================
 CREATE EVENT evt_archive_old_logs_monthly
 ON SCHEDULE EVERY 1 MONTH STARTS CURRENT_TIMESTAMP
 DO
+BEGIN
+    INSERT IGNORE INTO log_cambios_precio_archivo
+        (id_log, id_producto, precio_anterior, precio_nuevo, fecha_cambio)
+    SELECT id_log, id_producto, precio_anterior, precio_nuevo, fecha_cambio
+    FROM log_cambios_precio
+    WHERE fecha_cambio < DATE_SUB(NOW(), INTERVAL 6 MONTH);
+
     DELETE FROM log_cambios_precio
-    WHERE fecha_cambio < DATE_SUB(NOW(), INTERVAL 6 MONTH)$$
+    WHERE fecha_cambio < DATE_SUB(NOW(), INTERVAL 6 MONTH);
+END$$
 
 -- =====================================================================
 -- 4. evt_deactivate_expired_promotions_hourly
@@ -186,7 +224,13 @@ CREATE EVENT evt_recalculate_customer_loyalty_tiers_nightly
 ON SCHEDULE EVERY 1 DAY STARTS (TIMESTAMP(CURDATE()) + INTERVAL 1 DAY + INTERVAL 2 HOUR)
 DO
     UPDATE clientes
-        SET nivel_lealtad = fn_DeterminarEstadoLealtad(id_cliente)$$
+        SET nivel_lealtad = fn_DeterminarEstadoLealtad(id_cliente),
+            fecha_ultima_compra = (
+                SELECT MAX(v.fecha_venta)
+                FROM ventas v
+                WHERE v.id_cliente = clientes.id_cliente
+                  AND v.estado <> 'Cancelado'
+            )$$
 
 -- =====================================================================
 -- 6. evt_generate_reorder_list_daily
@@ -259,10 +303,17 @@ CREATE EVENT evt_check_data_consistency_nightly
 ON SCHEDULE EVERY 1 DAY STARTS (TIMESTAMP(CURDATE()) + INTERVAL 1 DAY + INTERVAL 3 HOUR)
 DO
     INSERT INTO inconsistencias_detectadas (descripcion, referencia_id)
-    SELECT 'Venta sin detalle asociado', v.id_venta
-    FROM ventas v
-    LEFT JOIN detalle_ventas dv ON dv.id_venta = v.id_venta
-    WHERE dv.id_detalle IS NULL$$
+        SELECT 'Venta sin detalle asociado', v.id_venta
+        FROM ventas v
+        LEFT JOIN detalle_ventas dv ON dv.id_venta = v.id_venta
+        WHERE dv.id_detalle IS NULL
+            AND NOT EXISTS (
+                    SELECT 1
+                    FROM inconsistencias_detectadas i
+                    WHERE i.referencia_id = v.id_venta
+                        AND i.descripcion = 'Venta sin detalle asociado'
+                        AND i.fecha_deteccion >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+            )$$
 
 -- =====================================================================
 -- 11. evt_send_birthday_greetings_daily
@@ -272,8 +323,8 @@ DO
 CREATE EVENT evt_send_birthday_greetings_daily
 ON SCHEDULE EVERY 1 DAY STARTS CURRENT_TIMESTAMP
 DO
-    INSERT INTO cupones_cumpleanos (id_cliente)
-    SELECT id_cliente
+    INSERT IGNORE INTO cupones_cumpleanos (id_cliente, anio_cupon)
+    SELECT id_cliente, YEAR(CURDATE())
     FROM clientes
     WHERE MONTH(fecha_nacimiento) = MONTH(CURDATE())
       AND DAY(fecha_nacimiento) = DAY(CURDATE())$$
@@ -294,9 +345,11 @@ BEGIN
         total_unidades,
         RANK() OVER (ORDER BY total_unidades DESC)
     FROM (
-        SELECT p.id_producto, COALESCE(SUM(dv.cantidad), 0) AS total_unidades
+         SELECT p.id_producto,
+             COALESCE(SUM(CASE WHEN v.id_venta IS NOT NULL THEN dv.cantidad ELSE 0 END), 0) AS total_unidades
         FROM productos p
         LEFT JOIN detalle_ventas dv ON dv.id_producto = p.id_producto
+        LEFT JOIN ventas v ON v.id_venta = dv.id_venta AND v.estado <> 'Cancelado'
         GROUP BY p.id_producto
     ) AS ventas_por_producto;
 END$$
@@ -356,9 +409,13 @@ BEGIN
             WHERE YEAR(fecha_venta) = YEAR(CURDATE() - INTERVAL 1 MONTH)
               AND MONTH(fecha_venta) = MONTH(CURDATE() - INTERVAL 1 MONTH)
               AND estado <> 'Cancelado'),
-        (SELECT COUNT(*) FROM clientes
+                (SELECT COUNT(*) FROM clientes
             WHERE YEAR(fecha_registro) = YEAR(CURDATE() - INTERVAL 1 MONTH)
-              AND MONTH(fecha_registro) = MONTH(CURDATE() - INTERVAL 1 MONTH));
+                            AND MONTH(fecha_registro) = MONTH(CURDATE() - INTERVAL 1 MONTH))
+        ON DUPLICATE KEY UPDATE
+                        total_ventas = VALUES(total_ventas),
+                        monto_total_vendido = VALUES(monto_total_vendido),
+                        clientes_nuevos = VALUES(clientes_nuevos);
 END$$
 
 -- =====================================================================
@@ -376,11 +433,12 @@ BEGIN
     SELECT
         cat.id_categoria,
         cat.nombre,
-        COALESCE(SUM(dv.cantidad), 0),
-        COALESCE(SUM(dv.cantidad * dv.precio_unitario_congelado), 0)
+        COALESCE(SUM(CASE WHEN v.id_venta IS NOT NULL THEN dv.cantidad ELSE 0 END), 0),
+        COALESCE(SUM(CASE WHEN v.id_venta IS NOT NULL THEN dv.cantidad * dv.precio_unitario_congelado ELSE 0 END), 0)
     FROM categorias cat
     LEFT JOIN productos p ON p.id_categoria = cat.id_categoria
     LEFT JOIN detalle_ventas dv ON dv.id_producto = p.id_producto
+    LEFT JOIN ventas v ON v.id_venta = dv.id_venta AND v.estado <> 'Cancelado'
     GROUP BY cat.id_categoria, cat.nombre;
 END$$
 
@@ -405,12 +463,18 @@ CREATE EVENT evt_detect_fraudulent_activity_hourly
 ON SCHEDULE EVERY 1 HOUR STARTS CURRENT_TIMESTAMP
 DO
     INSERT INTO actividad_sospechosa (id_cliente, motivo)
-    SELECT id_cliente, CONCAT('Más de 3 ventas canceladas en 24h: ', COUNT(*))
-    FROM ventas
-    WHERE estado = 'Cancelado'
-      AND fecha_venta >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-    GROUP BY id_cliente
-    HAVING COUNT(*) > 3$$
+        SELECT v.id_cliente, CONCAT('Más de 3 ventas canceladas en 24h: ', COUNT(*))
+        FROM ventas v
+        WHERE v.estado = 'Cancelado'
+            AND v.fecha_venta >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        GROUP BY v.id_cliente
+        HAVING COUNT(*) > 3
+             AND NOT EXISTS (
+                     SELECT 1
+                     FROM actividad_sospechosa a
+                     WHERE a.id_cliente = v.id_cliente
+                         AND a.fecha_deteccion >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+             )$$
 
 -- =====================================================================
 -- 19. evt_generate_supplier_performance_report_monthly
@@ -425,15 +489,19 @@ DO
         prov.id_proveedor,
         YEAR(CURDATE() - INTERVAL 1 MONTH),
         MONTH(CURDATE() - INTERVAL 1 MONTH),
-        COALESCE(SUM(dv.cantidad), 0),
-        COALESCE(SUM(dv.cantidad * dv.precio_unitario_congelado), 0)
+        COALESCE(SUM(CASE WHEN v.id_venta IS NOT NULL THEN dv.cantidad ELSE 0 END), 0),
+        COALESCE(SUM(CASE WHEN v.id_venta IS NOT NULL THEN dv.cantidad * dv.precio_unitario_congelado ELSE 0 END), 0)
     FROM proveedores prov
     LEFT JOIN productos p ON p.id_proveedor = prov.id_proveedor
     LEFT JOIN detalle_ventas dv ON dv.id_producto = p.id_producto
     LEFT JOIN ventas v ON v.id_venta = dv.id_venta
         AND YEAR(v.fecha_venta) = YEAR(CURDATE() - INTERVAL 1 MONTH)
         AND MONTH(v.fecha_venta) = MONTH(CURDATE() - INTERVAL 1 MONTH)
-    GROUP BY prov.id_proveedor$$
+        AND v.estado <> 'Cancelado'
+    GROUP BY prov.id_proveedor
+    ON DUPLICATE KEY UPDATE
+        unidades_vendidas = VALUES(unidades_vendidas),
+        ingresos_generados = VALUES(ingresos_generados)$$
 
 -- =====================================================================
 -- 20. evt_purge_soft_deleted_records_weekly
