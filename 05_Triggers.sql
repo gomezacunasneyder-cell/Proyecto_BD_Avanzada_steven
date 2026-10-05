@@ -5,7 +5,9 @@ USE ecommerce_db;
 -- (log_cambios_precio ya fue creada en 01_Esquema_y_Datos.sql)
 -- ---------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS auditoria_clientes (
+-- Renombrada de auditoria_clientes para no chocar con Auditoria_Clientes (08_Auditoria_Clientes.sql):
+-- en MySQL sobre Windows/macOS los nombres de tabla no distinguen mayúsculas.
+CREATE TABLE IF NOT EXISTS auditoria_altas_clientes (
     id_auditoria    INT AUTO_INCREMENT PRIMARY KEY,
     id_cliente      INT NOT NULL,
     accion          VARCHAR(50) NOT NULL,
@@ -164,13 +166,13 @@ END$$
 -- =====================================================================
 -- 5. trg_log_new_customer_after_insert
 -- Evento elegido: AFTER INSERT en clientes.
--- Registra en auditoria_clientes cada alta de cliente nuevo.
+-- Registra en auditoria_altas_clientes cada alta de cliente nuevo.
 -- =====================================================================
 CREATE TRIGGER trg_log_new_customer_after_insert
 AFTER INSERT ON clientes
 FOR EACH ROW
 BEGIN
-    INSERT INTO auditoria_clientes (id_cliente, accion)
+    INSERT INTO auditoria_altas_clientes (id_cliente, accion)
     VALUES (NEW.id_cliente, 'ALTA_CLIENTE');
 END$$
 
